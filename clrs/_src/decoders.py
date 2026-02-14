@@ -19,10 +19,11 @@ from typing import Dict, Optional
 
 import chex
 from clrs._src import probing
-from clrs._src import specs
+from clrs._src import specs, layers
 import haiku as hk
 import jax
 import jax.numpy as jnp
+
 
 _Array = chex.Array
 _DataPoint = probing.DataPoint
@@ -65,9 +66,11 @@ def log_sinkhorn(x: _Array, steps: int, temperature: float, zero_diagonal: bool,
 
 
 def construct_decoders(loc: str, t: str, hidden_dim: int, nb_dims: int,
-                       name: str):
+                       name: str, num_tasks: int, encoder_decoder_rank: int, algorithm_index: int):
   """Constructs decoders."""
-  linear = functools.partial(hk.Linear, name=f"{name}_dec_linear")
+  linear = functools.partial(
+    layers.Linear, name=f"{name}_dec_linear",
+    num_tasks=num_tasks, encoder_decoder_rank=encoder_decoder_rank, algorithm_index=algorithm_index)
   if loc == _Location.NODE:
     # Node decoders.
     if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:

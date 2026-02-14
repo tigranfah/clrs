@@ -27,6 +27,7 @@ from clrs._src import probing
 from clrs._src import processors
 from clrs._src import samplers
 from clrs._src import specs
+from clrs._src import layers
 
 import haiku as hk
 import jax
@@ -67,7 +68,6 @@ class MessagePassingStateChunked:
   hiddens: chex.Array
   lstm_state: Optional[hk.LSTMState]
 
-
 class Net(hk.Module):
   """Building blocks (networks) used to encode and decode messages."""
 
@@ -87,6 +87,8 @@ class Net(hk.Module):
       nb_msg_passing_steps=1,
       debug=False,
       name: str = 'net',
+      shared_encoders_decoders: bool=False,
+      encoder_decoder_rank: int=0
   ):
     """Constructs a `Net`."""
     super().__init__(name=name)
@@ -104,6 +106,8 @@ class Net(hk.Module):
     self.encoder_init = encoder_init
     self.nb_msg_passing_steps = nb_msg_passing_steps
     self.debug = debug
+    self.shared_encoders_decoders = shared_encoders_decoders
+    self.encoder_decoder_rank = encoder_decoder_rank
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -232,7 +236,10 @@ class Net(hk.Module):
       algorithm_indices = [algorithm_index]
     assert len(algorithm_indices) == len(features_list)
 
-    self.encoders, self.decoders = self._construct_encoders_decoders()
+    # if self.shared_encoders_decoders:
+    #     self.encoders, self.decoders = self._construct_shared_encoders_decoders()
+    # else:
+    self.encoders, self.decoders = self._construct_encoders_decoders(self.shared_encoders_decoders)
     self.processor = self.processor_factory(self.hidden_dim)
 
     # Optionally construct LSTM.
@@ -326,28 +333,36 @@ class Net(hk.Module):
 
     return output_preds, hint_preds
 
-  def _construct_encoders_decoders(self):
+  def _construct_encoders_decoders(self, share_params: bool=False):
     """Constructs encoders and decoders, separate for each algorithm."""
     encoders_ = []
     decoders_ = []
+    num_algos = len(self.spec)
     enc_algo_idx = None
     for (algo_idx, spec) in enumerate(self.spec):
       enc = {}
       dec = {}
       for name, (stage, loc, t) in spec.items():
+        if share_params:
+          module_name = f"shared_{name}"
+        else:
+          module_name = f'algo_{algo_idx}_{name}'
         if stage == _Stage.INPUT or (
             stage == _Stage.HINT and self.encode_hints):
           # Build input encoders.
           if name == specs.ALGO_IDX_INPUT_NAME:
             if enc_algo_idx is None:
-              enc_algo_idx = [hk.Linear(self.hidden_dim,
-                                        name=f'{name}_enc_linear')]
+              enc_algo_idx = [layers.Linear(self.hidden_dim,
+                                     name=f'{name}_enc_linear')]
             enc[name] = enc_algo_idx
           else:
             enc[name] = encoders.construct_encoders(
                 stage, loc, t, hidden_dim=self.hidden_dim,
                 init=self.encoder_init,
-                name=f'algo_{algo_idx}_{name}')
+                name=module_name,
+                num_tasks=num_algos,
+                encoder_decoder_rank=self.encoder_decoder_rank,
+                algorithm_index=algo_idx)
 
         if stage == _Stage.OUTPUT or (
             stage == _Stage.HINT and self.decode_hints):
@@ -355,11 +370,70 @@ class Net(hk.Module):
           dec[name] = decoders.construct_decoders(
               loc, t, hidden_dim=self.hidden_dim,
               nb_dims=self.nb_dims[algo_idx][name],
-              name=f'algo_{algo_idx}_{name}')
+              name=module_name,
+              num_tasks=num_algos,
+              encoder_decoder_rank=self.encoder_decoder_rank,
+              algorithm_index=algo_idx)
       encoders_.append(enc)
       decoders_.append(dec)
 
     return encoders_, decoders_
+
+#   def _construct_shared_encoders_decoders(self):
+#     """Construct ONE shared set of encoders/decoders for all algorithms."""
+
+#     encoders_ = []
+#     decoders_ = []
+#     shared_enc = {}
+#     shared_dec = {}
+
+#     num_algos = len(self.spec)
+
+#     for algo_idx, spec in enumerate(self.spec):
+#       enc = {}
+#       dec = {}
+#       for name, (stage, loc, t) in spec.items():
+
+#         if stage == _Stage.INPUT or (
+#             stage == _Stage.HINT and self.encode_hints):
+
+#           if name not in shared_enc:
+
+#             if name == specs.ALGO_IDX_INPUT_NAME:
+#               shared_enc[name] = [
+#                   layers.Linear(self.hidden_dim,
+#                          name=f'{name}_enc',
+#                          num_tasks=num_algos,
+#                          encoder_decoder_rank=self.encoder_decoder_rank)
+#               ]
+#             else:
+#               shared_enc[name] = encoders.construct_encoders(
+#                   stage, loc, t,
+#                   hidden_dim=self.hidden_dim,
+#                   init=self.encoder_init,
+#                   name=f'shared_{name}',
+#                   num_tasks=num_algos,
+#                   encoder_decoder_rank=self.encoder_decoder_rank
+#               )
+#           enc[name] = shared_enc[name]
+
+#         if stage == _Stage.OUTPUT or (
+#             stage == _Stage.HINT and self.decode_hints):
+
+#           if name not in shared_dec:
+#             shared_dec[name] = decoders.construct_decoders(
+#                 loc, t,
+#                 hidden_dim=self.hidden_dim,
+#                 nb_dims=self.nb_dims[algo_idx][name],
+#                 name=f'shared_{name}',
+#                 num_tasks=num_algos,
+#                 encoder_decoder_rank=self.encoder_decoder_rank
+#             )
+#           dec[name] = shared_dec[name]
+#       encoders_.append(enc)
+#       decoders_.append(dec)
+    
+#     return encoders_, decoders_
 
   def _one_step_pred(
       self,

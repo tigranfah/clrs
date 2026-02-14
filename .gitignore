@@ -5,6 +5,7 @@
 build/
 dist/
 venv/
+checkpoints/
 
 # Mac OS
 .DS_Store

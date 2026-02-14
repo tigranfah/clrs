@@ -161,6 +161,8 @@ class BaselineModel(model.Model):
       name: str = 'base_model',
       nb_msg_passing_steps: int = 1,
       debug: bool = False,
+      shared_encoders_decoders: bool = False,
+      encoder_decoder_rank: int = 0
   ):
     """Constructor for BaselineModel.
 
@@ -248,21 +250,23 @@ class BaselineModel(model.Model):
 
     self._create_net_fns(hidden_dim, encode_hints, processor_factory, use_lstm,
                          encoder_init, dropout_prob, hint_teacher_forcing,
-                         hint_repred_mode)
+                         hint_repred_mode, shared_encoders_decoders, encoder_decoder_rank)
     self._device_params = None
     self._device_opt_state = None
     self.opt_state_skeleton = None
 
   def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
                       use_lstm, encoder_init, dropout_prob,
-                      hint_teacher_forcing, hint_repred_mode):
+                      hint_teacher_forcing, hint_repred_mode, shared_encoders_decoders, encoder_decoder_rank):
     def _use_net(*args, **kwargs):
       return nets.Net(self._spec, hidden_dim, encode_hints, self.decode_hints,
                       processor_factory, use_lstm, encoder_init,
                       dropout_prob, hint_teacher_forcing,
                       hint_repred_mode,
                       self.nb_dims, self.nb_msg_passing_steps,
-                      self.debug)(*args, **kwargs)
+                      self.debug,
+                      shared_encoders_decoders=shared_encoders_decoders,
+                      encoder_decoder_rank=encoder_decoder_rank)(*args, **kwargs)
 
     self.net_fn = hk.transform(_use_net)
     pmap_args = dict(axis_name='batch', devices=jax.local_devices())
@@ -488,7 +492,7 @@ class BaselineModel(model.Model):
 
     return losses_
 
-  def restore_model(self, file_name: str, only_load_processor: bool = False):
+  def restore_model(self, file_name: str, only_load_processor: bool = False, load_optimizer: bool = False):
     """Restore model from `file_name`."""
     path = os.path.join(self.checkpoint_path, file_name)
     with open(path, 'rb') as f:
@@ -498,7 +502,8 @@ class BaselineModel(model.Model):
       else:
         restored_params = restored_state['params']
       self.params = hk.data_structures.merge(self.params, restored_params)
-      self.opt_state = restored_state['opt_state']
+      if load_optimizer:
+        self.opt_state = restored_state['opt_state']
 
   def save_model(self, file_name: str):
     """Save model (processor weights only) to `file_name`."""
@@ -778,7 +783,8 @@ def filter_null_grads(grads, opt, opt_state, opt_state_skeleton, algo_idx):
     # Note: in shared pointer decoder modes, we should exclude shared params
     #       for algos that do not have pointer outputs.
     if ((processors.PROCESSOR_TAG in k) or
-        (f'algo_{algo_idx}_' in k)):
+        (f'algo_{algo_idx}_' in k) or
+        ('shared_' in k)):
       return v
     return jax.tree_util.tree_map(lambda x: None, v)
 

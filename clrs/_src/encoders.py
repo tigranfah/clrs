@@ -17,7 +17,7 @@
 import functools
 import chex
 from clrs._src import probing
-from clrs._src import specs
+from clrs._src import specs, layers
 import haiku as hk
 import jax.numpy as jnp
 
@@ -30,7 +30,8 @@ _Type = specs.Type
 
 
 def construct_encoders(stage: str, loc: str, t: str,
-                       hidden_dim: int, init: str, name: str):
+                       hidden_dim: int, init: str, name: str,
+                       num_tasks: int,encoder_decoder_rank: int, algorithm_index: int):
   """Constructs encoders."""
   if init == 'xavier_on_scalars' and stage == _Stage.HINT and t == _Type.SCALAR:
     initialiser = hk.initializers.TruncatedNormal(
@@ -40,9 +41,13 @@ def construct_encoders(stage: str, loc: str, t: str,
   else:
     raise ValueError(f'Encoder initialiser {init} not supported.')
   linear = functools.partial(
-      hk.Linear,
+      layers.Linear,
       w_init=initialiser,
-      name=f'{name}_enc_linear')
+      name=f'{name}_enc_linear',
+      num_tasks=num_tasks,
+      encoder_decoder_rank=encoder_decoder_rank,
+      algorithm_index=algorithm_index
+  )
   encoders = [linear(hidden_dim)]
   if loc == _Location.EDGE and t == _Type.POINTER:
     # Edge pointers need two-way encoders.
