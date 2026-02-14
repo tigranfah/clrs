@@ -633,7 +633,11 @@ def main(unused_argv):
       if (sum(val_scores) > best_score) or step == 0:
         best_score = sum(val_scores)
         logging.info('Checkpointing best model, %s', msg)
-        train_model.save_model('best.pkl')
+        checkpoint_name = "+".join(FLAGS.algorithms)
+        checkpoint_name += f"-shared={FLAGS.shared_encoders_decoders}"
+        checkpoint_name += f"-encdec_rank={FLAGS.encoder_decoder_rank}"
+        checkpoint_name += f"-steps={FLAGS.train_steps}"
+        train_model.save_model(f'{checkpoint_name}.pkl')
       else:
         logging.info('Not saving new best model, %s', msg)
 
