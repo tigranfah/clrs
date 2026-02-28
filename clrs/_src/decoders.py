@@ -299,7 +299,7 @@ def _decode_edge_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
                       jnp.expand_dims(
                           jnp.expand_dims(pred_2, -3), -3))
 
-    preds = jnp.squeeze(decoders[4](p_m), -1, algorithm_index=algorithm_index)
+    preds = jnp.squeeze(decoders[4](p_m), -1)
   else:
     raise ValueError("Invalid output type")
   if inf_bias_edge and t in [_Type.MASK, _Type.MASK_ONE]:
