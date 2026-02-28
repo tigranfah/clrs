@@ -31,7 +31,7 @@ _Type = specs.Type
 
 def construct_encoders(stage: str, loc: str, t: str,
                        hidden_dim: int, init: str, name: str,
-                       num_tasks: int,encoder_decoder_rank: int, algorithm_index: int):
+                       num_tasks: int,encoder_decoder_rank: int):
   """Constructs encoders."""
   if init == 'xavier_on_scalars' and stage == _Stage.HINT and t == _Type.SCALAR:
     initialiser = hk.initializers.TruncatedNormal(
@@ -45,8 +45,7 @@ def construct_encoders(stage: str, loc: str, t: str,
       w_init=initialiser,
       name=f'{name}_enc_linear',
       num_tasks=num_tasks,
-      encoder_decoder_rank=encoder_decoder_rank,
-      algorithm_index=algorithm_index
+      encoder_decoder_rank=encoder_decoder_rank
   )
   encoders = [linear(hidden_dim)]
   if loc == _Location.EDGE and t == _Type.POINTER:
@@ -96,18 +95,18 @@ def accum_adj_mat(dp: _DataPoint, adj_mat: _Array) -> _Array:
   return (adj_mat > 0.).astype('float32')  # pytype: disable=attribute-error  # numpy-scalars
 
 
-def accum_edge_fts(encoders, dp: _DataPoint, edge_fts: _Array) -> _Array:
+def accum_edge_fts(encoders, dp: _DataPoint, edge_fts: _Array, algorithm_index: int = None) -> _Array:
   """Encodes and accumulates edge features."""
   if dp.location == _Location.NODE and dp.type_ in [_Type.POINTER,
                                                     _Type.PERMUTATION_POINTER]:
-    encoding = _encode_inputs(encoders, dp)
+    encoding = _encode_inputs(encoders, dp, algorithm_index)
     edge_fts += encoding
 
   elif dp.location == _Location.EDGE:
-    encoding = _encode_inputs(encoders, dp)
+    encoding = _encode_inputs(encoders, dp, algorithm_index)
     if dp.type_ == _Type.POINTER:
       # Aggregate pointer contributions across sender and receiver nodes.
-      encoding_2 = encoders[1](jnp.expand_dims(dp.data, -1))
+      encoding_2 = encoders[1](jnp.expand_dims(dp.data, -1), algorithm_index=algorithm_index)
       edge_fts += jnp.mean(encoding, axis=1) + jnp.mean(encoding_2, axis=2)
     else:
       edge_fts += encoding
@@ -115,30 +114,30 @@ def accum_edge_fts(encoders, dp: _DataPoint, edge_fts: _Array) -> _Array:
   return edge_fts
 
 
-def accum_node_fts(encoders, dp: _DataPoint, node_fts: _Array) -> _Array:
+def accum_node_fts(encoders, dp: _DataPoint, node_fts: _Array, algorithm_index: int=None) -> _Array:
   """Encodes and accumulates node features."""
   is_pointer = (dp.type_ in [_Type.POINTER, _Type.PERMUTATION_POINTER])
   if ((dp.location == _Location.NODE and not is_pointer) or
       (dp.location == _Location.GRAPH and dp.type_ == _Type.POINTER)):
-    encoding = _encode_inputs(encoders, dp)
+    encoding = _encode_inputs(encoders, dp, algorithm_index)
     node_fts += encoding
 
   return node_fts
 
 
 def accum_graph_fts(encoders, dp: _DataPoint,
-                    graph_fts: _Array) -> _Array:
+                    graph_fts: _Array, algorithm_index: int=None) -> _Array:
   """Encodes and accumulates graph features."""
   if dp.location == _Location.GRAPH and dp.type_ != _Type.POINTER:
-    encoding = _encode_inputs(encoders, dp)
+    encoding = _encode_inputs(encoders, dp, algorithm_index)
     graph_fts += encoding
 
   return graph_fts
 
 
-def _encode_inputs(encoders, dp: _DataPoint) -> _Array:
+def _encode_inputs(encoders, dp: _DataPoint, algorithm_index: int = None) -> _Array:
   if dp.type_ == _Type.CATEGORICAL:
-    encoding = encoders[0](dp.data)
+    encoding = encoders[0](dp.data, algorithm_index=algorithm_index)
   else:
-    encoding = encoders[0](jnp.expand_dims(dp.data, -1))
+    encoding = encoders[0](jnp.expand_dims(dp.data, -1), algorithm_index=algorithm_index)
   return encoding

@@ -15,8 +15,7 @@ class Linear(hk.Module):
       b_init: hk.initializers.Initializer | None = None,
       name: str | None = None,
       num_tasks: int = 1,
-      encoder_decoder_rank: int = 0,
-      algorithm_index: int = None
+      encoder_decoder_rank: int = 0
   ):
     """Constructs the Linear module.
 
@@ -38,13 +37,13 @@ class Linear(hk.Module):
     
     self.num_tasks = num_tasks
     self.encoder_decoder_rank = encoder_decoder_rank
-    self.algorithm_index = algorithm_index
 
   def __call__(
       self,
       inputs: jax.Array,
       *,
       precision = None,
+      algorithm_index: int=None
   ) -> jax.Array:
     """Computes a linear transform of the input."""
     if not inputs.shape:
@@ -61,7 +60,7 @@ class Linear(hk.Module):
     w = hk.get_parameter("w", [input_size, output_size], dtype, init=w_init)
 
     if self.encoder_decoder_rank > 0:
-      assert self.algorithm_index is not None
+      assert algorithm_index is not None
 
       A = hk.get_parameter(
           "A",
@@ -77,7 +76,7 @@ class Linear(hk.Module):
           init=hk.initializers.RandomNormal(0.02),
       )
 
-      delta = jnp.matmul(A[self.algorithm_index], B[self.algorithm_index])
+      delta = jnp.matmul(A[algorithm_index], B[algorithm_index])
       w = w + delta
 
     out = jnp.dot(inputs, w, precision=precision)

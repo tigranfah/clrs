@@ -66,11 +66,11 @@ def log_sinkhorn(x: _Array, steps: int, temperature: float, zero_diagonal: bool,
 
 
 def construct_decoders(loc: str, t: str, hidden_dim: int, nb_dims: int,
-                       name: str, num_tasks: int, encoder_decoder_rank: int, algorithm_index: int):
+                       name: str, num_tasks: int, encoder_decoder_rank: int):
   """Constructs decoders."""
   linear = functools.partial(
     layers.Linear, name=f"{name}_dec_linear",
-    num_tasks=num_tasks, encoder_decoder_rank=encoder_decoder_rank, algorithm_index=algorithm_index)
+    num_tasks=num_tasks, encoder_decoder_rank=encoder_decoder_rank)
   if loc == _Location.NODE:
     # Node decoders.
     if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
@@ -208,6 +208,7 @@ def decode_fts(
     inf_bias: bool,
     inf_bias_edge: bool,
     repred: bool,
+    algorithm_index: int = None
 ):
   """Decodes node, edge and graph features."""
   output_preds = {}
@@ -219,12 +220,12 @@ def decode_fts(
 
     if loc == _Location.NODE:
       preds = _decode_node_fts(decoder, t, h_t, edge_fts, adj_mat,
-                               inf_bias, repred)
+                               inf_bias, repred, algorithm_index)
     elif loc == _Location.EDGE:
       preds = _decode_edge_fts(decoder, t, h_t, edge_fts, adj_mat,
-                               inf_bias_edge)
+                               inf_bias_edge, algorithm_index)
     elif loc == _Location.GRAPH:
-      preds = _decode_graph_fts(decoder, t, h_t, graph_fts)
+      preds = _decode_graph_fts(decoder, t, h_t, graph_fts, algorithm_index)
     else:
       raise ValueError("Invalid output type")
 
@@ -239,23 +240,24 @@ def decode_fts(
 
 
 def _decode_node_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
-                     adj_mat: _Array, inf_bias: bool, repred: bool) -> _Array:
+                     adj_mat: _Array, inf_bias: bool, repred: bool,
+                     algorithm_index: int=None) -> _Array:
   """Decodes node features."""
 
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
-    preds = jnp.squeeze(decoders[0](h_t), -1)
+    preds = jnp.squeeze(decoders[0](h_t, algorithm_index=algorithm_index), -1)
   elif t == _Type.CATEGORICAL:
-    preds = decoders[0](h_t)
+    preds = decoders[0](h_t, algorithm_index=algorithm_index)
   elif t in [_Type.POINTER, _Type.PERMUTATION_POINTER]:
-    p_1 = decoders[0](h_t)
-    p_2 = decoders[1](h_t)
-    p_3 = decoders[2](edge_fts)
+    p_1 = decoders[0](h_t, algorithm_index=algorithm_index)
+    p_2 = decoders[1](h_t, algorithm_index=algorithm_index)
+    p_3 = decoders[2](edge_fts, algorithm_index=algorithm_index)
 
     p_e = jnp.expand_dims(p_2, -2) + p_3
     p_m = jnp.maximum(jnp.expand_dims(p_1, -2),
                       jnp.transpose(p_e, (0, 2, 1, 3)))
 
-    preds = jnp.squeeze(decoders[3](p_m), -1)
+    preds = jnp.squeeze(decoders[3](p_m, algorithm_index=algorithm_index), -1)
 
     if inf_bias:
       per_batch_min = jnp.min(preds, axis=range(1, preds.ndim), keepdims=True)
@@ -278,25 +280,26 @@ def _decode_node_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
 
 
 def _decode_edge_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
-                     adj_mat: _Array, inf_bias_edge: bool) -> _Array:
+                     adj_mat: _Array, inf_bias_edge: bool,
+                     algorithm_index: int = None) -> _Array:
   """Decodes edge features."""
 
-  pred_1 = decoders[0](h_t)
-  pred_2 = decoders[1](h_t)
-  pred_e = decoders[2](edge_fts)
+  pred_1 = decoders[0](h_t, algorithm_index=algorithm_index)
+  pred_2 = decoders[1](h_t, algorithm_index=algorithm_index)
+  pred_e = decoders[2](edge_fts, algorithm_index=algorithm_index)
   pred = (jnp.expand_dims(pred_1, -2) + jnp.expand_dims(pred_2, -3) + pred_e)
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
     preds = jnp.squeeze(pred, -1)
   elif t == _Type.CATEGORICAL:
     preds = pred
   elif t == _Type.POINTER:
-    pred_2 = decoders[3](h_t)
+    pred_2 = decoders[3](h_t, algorithm_index=algorithm_index)
 
     p_m = jnp.maximum(jnp.expand_dims(pred, -2),
                       jnp.expand_dims(
                           jnp.expand_dims(pred_2, -3), -3))
 
-    preds = jnp.squeeze(decoders[4](p_m), -1)
+    preds = jnp.squeeze(decoders[4](p_m), -1, algorithm_index=algorithm_index)
   else:
     raise ValueError("Invalid output type")
   if inf_bias_edge and t in [_Type.MASK, _Type.MASK_ONE]:
@@ -309,19 +312,19 @@ def _decode_edge_fts(decoders, t: str, h_t: _Array, edge_fts: _Array,
 
 
 def _decode_graph_fts(decoders, t: str, h_t: _Array,
-                      graph_fts: _Array) -> _Array:
+                      graph_fts: _Array, algorithm_index: int=None) -> _Array:
   """Decodes graph features."""
 
   gr_emb = jnp.max(h_t, axis=-2)
-  pred_n = decoders[0](gr_emb)
-  pred_g = decoders[1](graph_fts)
+  pred_n = decoders[0](gr_emb, algorithm_index=algorithm_index)
+  pred_g = decoders[1](graph_fts, algorithm_index=algorithm_index)
   pred = pred_n + pred_g
   if t in [_Type.SCALAR, _Type.MASK, _Type.MASK_ONE]:
     preds = jnp.squeeze(pred, -1)
   elif t == _Type.CATEGORICAL:
     preds = pred
   elif t == _Type.POINTER:
-    pred_2 = decoders[2](h_t)
+    pred_2 = decoders[2](h_t, algorithm_index=algorithm_index)
     ptr_p = jnp.expand_dims(pred, 1) + jnp.transpose(pred_2, (0, 2, 1))
     preds = jnp.squeeze(ptr_p, 1)
   else:

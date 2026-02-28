@@ -123,7 +123,8 @@ class Net(hk.Module):
                         encs: Dict[str, List[hk.Module]],
                         decs: Dict[str, Tuple[hk.Module]],
                         return_hints: bool,
-                        return_all_outputs: bool
+                        return_all_outputs: bool,
+                        algorithm_index: int
                         ):
     if self.decode_hints and not first_step:
       assert self._hint_repred_mode in ['soft', 'hard', 'hard_on_eval']
@@ -171,7 +172,7 @@ class Net(hk.Module):
     hiddens, output_preds_cand, hint_preds, lstm_state = self._one_step_pred(
         inputs, cur_hint, mp_state.hiddens,
         batch_size, nb_nodes, mp_state.lstm_state,
-        spec, encs, decs, repred)
+        spec, encs, decs, repred, algorithm_index)
 
     if first_step:
       output_preds = output_preds_cand
@@ -288,6 +289,7 @@ class Net(hk.Module):
           decs=self.decoders[algorithm_index],
           return_hints=return_hints,
           return_all_outputs=return_all_outputs,
+          algorithm_index=algorithm_index
           )
       mp_state, lean_mp_state = self._msg_passing_step(
           mp_state,
@@ -339,43 +341,108 @@ class Net(hk.Module):
     decoders_ = []
     num_algos = len(self.spec)
     enc_algo_idx = None
-    for (algo_idx, spec) in enumerate(self.spec):
-      enc = {}
-      dec = {}
-      for name, (stage, loc, t) in spec.items():
-        if share_params:
-          module_name = f"shared_{name}"
-        else:
-          module_name = f'algo_{algo_idx}_{name}'
-        if stage == _Stage.INPUT or (
-            stage == _Stage.HINT and self.encode_hints):
-          # Build input encoders.
+
+    if share_params:
+      # Build a pool of shared encoders/decoders ONCE
+      shared_enc_pool = {}
+      shared_dec_pool = {}
+      
+      # Collect all unique features
+      all_features = {}
+      for spec in self.spec:
+        for name, (stage, loc, t) in spec.items():
+          if name not in all_features:
+            all_features[name] = (stage, loc, t)
+      
+      # Build an encoder per feature
+      for name, (stage, loc, t) in all_features.items():
+        if stage == _Stage.INPUT or (stage == _Stage.HINT and self.encode_hints):
           if name == specs.ALGO_IDX_INPUT_NAME:
             if enc_algo_idx is None:
-              enc_algo_idx = [layers.Linear(self.hidden_dim,
-                                     name=f'{name}_enc_linear')]
-            enc[name] = enc_algo_idx
+              enc_algo_idx = [layers.Linear(
+                  self.hidden_dim,
+                  name=f'{name}_enc_linear',
+                  num_tasks=num_algos,
+                  encoder_decoder_rank=self.encoder_decoder_rank,
+              )]
+            shared_enc_pool[name] = enc_algo_idx
           else:
-            enc[name] = encoders.construct_encoders(
-                stage, loc, t, hidden_dim=self.hidden_dim,
+            shared_enc_pool[name] = encoders.construct_encoders(
+                stage, loc, t,
+                hidden_dim=self.hidden_dim,
                 init=self.encoder_init,
-                name=module_name,
+                name=f'shared_{name}',
                 num_tasks=num_algos,
                 encoder_decoder_rank=self.encoder_decoder_rank,
-                algorithm_index=algo_idx)
+            )
+        
+        if stage == _Stage.OUTPUT or (stage == _Stage.HINT and self.decode_hints):
+          nb_dims = None
+          for algo_idx, spec in enumerate(self.spec):
+            if name in self.nb_dims[algo_idx]:
+              nb_dims = self.nb_dims[algo_idx][name]
+              break
+          
+          if nb_dims is not None:
+            shared_dec_pool[name] = decoders.construct_decoders(
+                loc, t,
+                hidden_dim=self.hidden_dim,
+                nb_dims=nb_dims,
+                name=f'shared_{name}',
+                num_tasks=num_algos,
+                encoder_decoder_rank=self.encoder_decoder_rank,
+            )
+      
+      # For each algorithm, create a dict with only ITS features
+      for algo_idx, spec in enumerate(self.spec):
+        enc = {}
+        dec = {}
+        
+        for name, (stage, loc, t) in spec.items():
+          if stage == _Stage.INPUT or (stage == _Stage.HINT and self.encode_hints):
+            enc[name] = shared_enc_pool[name]
+          
+          if stage == _Stage.OUTPUT or (stage == _Stage.HINT and self.decode_hints):
+            dec[name] = shared_dec_pool[name]
+        
+        encoders_.append(enc)
+        decoders_.append(dec)
 
-        if stage == _Stage.OUTPUT or (
-            stage == _Stage.HINT and self.decode_hints):
-          # Build output decoders.
-          dec[name] = decoders.construct_decoders(
-              loc, t, hidden_dim=self.hidden_dim,
-              nb_dims=self.nb_dims[algo_idx][name],
-              name=module_name,
-              num_tasks=num_algos,
-              encoder_decoder_rank=self.encoder_decoder_rank,
-              algorithm_index=algo_idx)
-      encoders_.append(enc)
-      decoders_.append(dec)
+    else:
+      for (algo_idx, spec) in enumerate(self.spec):
+        enc = {}
+        dec = {}
+        for name, (stage, loc, t) in spec.items():
+          module_name = f'algo_{algo_idx}_{name}'
+          if stage == _Stage.INPUT or (
+              stage == _Stage.HINT and self.encode_hints):
+            # Build input encoders.
+            if name == specs.ALGO_IDX_INPUT_NAME:
+              if enc_algo_idx is None:
+                enc_algo_idx = [layers.Linear(self.hidden_dim,
+                                      name=f'{name}_enc_linear')]
+              enc[name] = enc_algo_idx
+            else:
+              enc[name] = encoders.construct_encoders(
+                  stage, loc, t, hidden_dim=self.hidden_dim,
+                  init=self.encoder_init,
+                  name=module_name,
+                  num_tasks=num_algos,
+                  encoder_decoder_rank=self.encoder_decoder_rank
+              )
+
+          if stage == _Stage.OUTPUT or (
+              stage == _Stage.HINT and self.decode_hints):
+            # Build output decoders.
+            dec[name] = decoders.construct_decoders(
+                loc, t, hidden_dim=self.hidden_dim,
+                nb_dims=self.nb_dims[algo_idx][name],
+                name=module_name,
+                num_tasks=num_algos,
+                encoder_decoder_rank=self.encoder_decoder_rank
+            )
+        encoders_.append(enc)
+        decoders_.append(dec)
 
     return encoders_, decoders_
 
@@ -447,6 +514,7 @@ class Net(hk.Module):
       encs: Dict[str, List[hk.Module]],
       decs: Dict[str, Tuple[hk.Module]],
       repred: bool,
+      algorithm_index: int
   ):
     """Generates one-step predictions."""
 
@@ -470,9 +538,9 @@ class Net(hk.Module):
           assert dp.type_ != _Type.SOFT_POINTER
           adj_mat = encoders.accum_adj_mat(dp, adj_mat)
           encoder = encs[dp.name]
-          edge_fts = encoders.accum_edge_fts(encoder, dp, edge_fts)
-          node_fts = encoders.accum_node_fts(encoder, dp, node_fts)
-          graph_fts = encoders.accum_graph_fts(encoder, dp, graph_fts)
+          edge_fts = encoders.accum_edge_fts(encoder, dp, edge_fts, algorithm_index)
+          node_fts = encoders.accum_node_fts(encoder, dp, node_fts, algorithm_index)
+          graph_fts = encoders.accum_graph_fts(encoder, dp, graph_fts, algorithm_index)
         except Exception as e:
           raise Exception(f'Failed to process {dp}') from e
 
@@ -517,6 +585,7 @@ class Net(hk.Module):
         inf_bias=self.processor.inf_bias,
         inf_bias_edge=self.processor.inf_bias_edge,
         repred=repred,
+        algorithm_index=algorithm_index
     )
 
     return nxt_hidden, output_preds, hint_preds, nxt_lstm_state
