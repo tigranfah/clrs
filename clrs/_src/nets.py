@@ -88,7 +88,8 @@ class Net(hk.Module):
       debug=False,
       name: str = 'net',
       shared_encoders_decoders: bool=False,
-      encoder_decoder_rank: int=0
+      encoder_decoder_rank: int=0,
+      num_lora_slots: int = None,
   ):
     """Constructs a `Net`."""
     super().__init__(name=name)
@@ -108,6 +109,7 @@ class Net(hk.Module):
     self.debug = debug
     self.shared_encoders_decoders = shared_encoders_decoders
     self.encoder_decoder_rank = encoder_decoder_rank
+    self.num_lora_slots = num_lora_slots
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -362,7 +364,7 @@ class Net(hk.Module):
               enc_algo_idx = [layers.Linear(
                   self.hidden_dim,
                   name=f'{name}_enc_linear',
-                  num_tasks=num_algos,
+                  num_tasks=self.num_lora_slots,
                   encoder_decoder_rank=self.encoder_decoder_rank,
               )]
             shared_enc_pool[name] = enc_algo_idx
@@ -372,7 +374,7 @@ class Net(hk.Module):
                 hidden_dim=self.hidden_dim,
                 init=self.encoder_init,
                 name=f'shared_{name}',
-                num_tasks=num_algos,
+                num_tasks=self.num_lora_slots,
                 encoder_decoder_rank=self.encoder_decoder_rank,
             )
         
@@ -389,7 +391,7 @@ class Net(hk.Module):
                 hidden_dim=self.hidden_dim,
                 nb_dims=nb_dims,
                 name=f'shared_{name}',
-                num_tasks=num_algos,
+                num_tasks=self.num_lora_slots,
                 encoder_decoder_rank=self.encoder_decoder_rank,
             )
       
@@ -427,7 +429,7 @@ class Net(hk.Module):
                   stage, loc, t, hidden_dim=self.hidden_dim,
                   init=self.encoder_init,
                   name=module_name,
-                  num_tasks=num_algos,
+                  num_tasks=self.num_lora_slots,
                   encoder_decoder_rank=self.encoder_decoder_rank
               )
 
@@ -438,7 +440,7 @@ class Net(hk.Module):
                 loc, t, hidden_dim=self.hidden_dim,
                 nb_dims=self.nb_dims[algo_idx][name],
                 name=module_name,
-                num_tasks=num_algos,
+                num_tasks=self.num_lora_slots,
                 encoder_decoder_rank=self.encoder_decoder_rank
             )
         encoders_.append(enc)

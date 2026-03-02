@@ -1,76 +1,113 @@
 import pickle
+import os
+import numpy as np
+from absl import app
+from absl import flags
+import clrs
+import jax
 
-# ==== paths ====
-dijkstra_ckpt_path = "checkpoints/dijkstra_10k.pkl"
-output_bfs_ckpt_path = "checkpoints/bfs_from_dijkstra_10k.pkl"
+FLAGS = flags.FLAGS
 
-# ==== load ====
-with open(dijkstra_ckpt_path, "rb") as f:
-    ckpt = pickle.load(f)
+flags.DEFINE_string('input_checkpoint', None, 'Path to input checkpoint')
+flags.DEFINE_string('output_checkpoint', None, 'Path to output checkpoint')
+flags.DEFINE_string('algorithm', None, 'Target algorithm name')
+flags.DEFINE_integer('num_lora_slots', 7, 'Number of LoRA slots')
+flags.DEFINE_integer('lora_rank', 2, 'LoRA rank')
+flags.DEFINE_integer('hidden_dim', 128, 'Hidden dimension')
+flags.DEFINE_integer('batch_size', 32, 'Batch size for initialization')
+flags.DEFINE_enum('hint_mode', 'encoded_decoded',
+                  ['encoded_decoded', 'decoded_only', 'none'],
+                  'Hint mode to match training')
 
-# Some CLRS checkpoints store params under "params"
-if "params" in ckpt:
-    weights = ckpt["params"]
-else:
-    weights = ckpt
-
-new_weights = {}
-
-def keep(key):
-    """Keys that should transfer directly."""
-    if key.startswith("net/mpnn_aggr_clrs_processor"):
-        return True
-
-    keep_list = [
-        "algo_0_A_enc_linear",
-        "algo_0_adj_enc_linear",
-        "algo_0_pos_enc_linear",
-        "algo_0_s_enc_linear",
-        "algo_0_pi_dec_linear",
-        "algo_0_pi_dec_linear_1",
-        "algo_0_pi_dec_linear_2",
-        "algo_0_pi_dec_linear_3",
-        "algo_0_pi_h_dec_linear",
-        "algo_0_pi_h_dec_linear_1",
-        "algo_0_pi_h_dec_linear_2",
-        "algo_0_pi_h_dec_linear_3",
-        "algo_0_pi_h_enc_linear",
-    ]
-
-    return any(k in key for k in keep_list)
+flags.mark_flag_as_required('input_checkpoint')
+flags.mark_flag_as_required('output_checkpoint')
+flags.mark_flag_as_required('algorithm')
 
 
-for k, v in weights.items():
+def main(argv):
+    print(f'Loading checkpoint: {FLAGS.input_checkpoint}')
+    with open(FLAGS.input_checkpoint, 'rb') as f:
+        checkpoint = pickle.load(f)
+    
+    old_params = checkpoint['params']
+    
+    print(f'Building model for {FLAGS.algorithm}')
+    sampler, spec = clrs.build_sampler(
+        FLAGS.algorithm,
+        seed=42,
+        num_samples=FLAGS.batch_size,
+        length=16,
+    )
+    
+    feedback = sampler.next(FLAGS.batch_size)
+    
+    processor_factory = clrs.get_processor_factory(
+        'triplet_gmpnn',
+        use_ln=True,
+        nb_triplet_fts=8
+    )
+    
+    if FLAGS.hint_mode == 'encoded_decoded':
+        encode_hints = True
+        decode_hints = True
+    elif FLAGS.hint_mode == 'decoded_only':
+        encode_hints = False
+        decode_hints = True
+    elif FLAGS.hint_mode == 'none':
+        encode_hints = False
+        decode_hints = False
+    
+    model = clrs.models.BaselineModel(
+        spec=[spec],
+        dummy_trajectory=[feedback],
+        processor_factory=processor_factory,
+        hidden_dim=FLAGS.hidden_dim,
+        encode_hints=encode_hints,
+        decode_hints=decode_hints,
+        shared_encoders_decoders=True,
+        encoder_decoder_rank=FLAGS.lora_rank,
+        num_lora_slots=FLAGS.num_lora_slots,
+    )
+    
+    print('Initializing model for target algorithm')
+    model.init([feedback.features], 42)
+    
+    new_params = model.params
 
-    # ===== processor + shared weights =====
-    if keep(k):
-        new_weights[k] = v
-        continue
+    print(f'\nAll param keys BEFORE copying ({len(new_params)} total):')
+    for k in sorted(new_params.keys()):
+        print(f'  {k}')
+    
+    print('Copying weights from checkpoint where available')
+    copied = []
+    initialized = []
+    
+    for module_name in new_params.keys():
+        if module_name in old_params:
+            new_params[module_name] = old_params[module_name]
+            copied.append(module_name)
+        else:
+            initialized.append(module_name)
+    
+    new_checkpoint = {'params': new_params}
+    
+    print(f'\nCopied {len(copied)} modules from checkpoint')
+    print(f'Randomly initialized {len(initialized)} missing modules:')
+    for m in initialized:
+        print(f'  {m}')
+    
+    print(f'\nFinal checkpoint keys ({len(new_params)} total):')
+    for k in sorted(new_params.keys()):
+        if '_construct_encoders_decoders' in k:
+            print(f'  {k}: {list(new_params[k].keys())}')
+    
+    print(f'\nSaving to {FLAGS.output_checkpoint}')
+    os.makedirs(os.path.dirname(FLAGS.output_checkpoint) or '.', exist_ok=True)
+    with open(FLAGS.output_checkpoint, 'wb') as f:
+        pickle.dump(new_checkpoint, f)
+    
+    print('Done')
 
-    # ===== map in_queue -> reach_h =====
-    if "algo_0_in_queue_enc_linear" in k:
-        new_key = k.replace("in_queue_enc", "reach_h_enc")
-        new_weights[new_key] = v
-        continue
 
-    if "algo_0_in_queue_dec_linear" in k:
-        new_key = k.replace("in_queue_dec", "reach_h_dec")
-        new_weights[new_key] = v
-        continue
-
-    # everything else is discarded
-
-
-# ==== wrap back if needed ====
-if "params" in ckpt:
-    ckpt["params"] = new_weights
-    out = ckpt
-else:
-    out = new_weights
-
-# ==== save ====
-with open(output_bfs_ckpt_path, "wb") as f:
-    pickle.dump(out, f)
-
-print("Done. BFS-compatible checkpoint saved to:", output_bfs_ckpt_path)
-print("Total keys:", len(new_weights))
+if __name__ == '__main__':
+    app.run(main)

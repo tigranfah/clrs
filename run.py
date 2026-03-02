@@ -17,6 +17,8 @@
 
 import functools
 from math import e
+import random
+import string
 import os
 import shutil
 from typing import Any, Dict, List, Optional
@@ -51,6 +53,8 @@ flags.DEFINE_boolean('enforce_permutations', True,
 flags.DEFINE_boolean('enforce_pred_as_input', True,
                      'Whether to change pred_h hints into pred inputs.')
 flags.DEFINE_integer('batch_size', 32, 'Batch size used for training.')
+flags.DEFINE_float('train_multiplier', -1,
+                   'Multiplier for training samples. -1 means infinite samples.')
 flags.DEFINE_boolean('chunked_training', False,
                      'Whether to use chunking for training.')
 flags.DEFINE_integer('chunk_length', 16,
@@ -116,6 +120,8 @@ flags.DEFINE_boolean('shared_encoders_decoders', False,
                      'Whether to use a shared set of encoders and decoders for all algorithms')
 flags.DEFINE_integer('encoder_decoder_rank', 0,
                      'If shared encoders and decoders are used what rank matrix to use for specific algorithm specialization')
+flags.DEFINE_integer('num_lora_slots', 7,
+                     'Total number of task slots in LoRA adapters')
 
 flags.DEFINE_string('checkpoint_path', '/tmp/CLRS30',
                     'Path in which checkpoints are saved.')
@@ -125,6 +131,8 @@ flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
                     'Path in which dataset is stored.')
 flags.DEFINE_boolean('freeze_processor', False,
                      'Whether to freeze the processor of the model.')
+flags.DEFINE_boolean('freeze_encoders_decoders_base', False,
+                     'Whether to freeze the base weights of the encoders and decoders of the model.')
 
 FLAGS = flags.FLAGS
 
@@ -427,8 +435,7 @@ def create_samplers(
           sizes=current_algo_train_lengths,
           split='train',
           batch_size=train_batch_size,
-          multiplier=-1,
-        #   multiplier=0.003,
+          multiplier=FLAGS.train_multiplier,
           randomize_pos=FLAGS.random_pos,
           chunked=FLAGS.chunked_training,
           sampler_kwargs=sampler_kwargs,
@@ -487,6 +494,9 @@ def main(unused_argv):
 
   train_lengths = [int(x) for x in FLAGS.train_lengths]
 
+  run_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+  logging.info(f'Run ID: {run_id}')
+
   rng = np.random.RandomState(FLAGS.seed)
   rng_key = jax.random.PRNGKey(rng.randint(2**32))
 
@@ -524,12 +534,14 @@ def main(unused_argv):
       grad_clip_max_norm=FLAGS.grad_clip_max_norm,
       checkpoint_path=FLAGS.checkpoint_path,
       freeze_processor=FLAGS.freeze_processor,
+      freeze_encoders_decoders_base=FLAGS.freeze_encoders_decoders_base,
       dropout_prob=FLAGS.dropout_prob,
       hint_teacher_forcing=FLAGS.hint_teacher_forcing,
       hint_repred_mode=FLAGS.hint_repred_mode,
       nb_msg_passing_steps=FLAGS.nb_msg_passing_steps,
       shared_encoders_decoders=FLAGS.shared_encoders_decoders,
-      encoder_decoder_rank=FLAGS.encoder_decoder_rank
+      encoder_decoder_rank=FLAGS.encoder_decoder_rank,
+      num_lora_slots=FLAGS.num_lora_slots
       )
 
   eval_model = clrs.models.BaselineModel(
@@ -572,6 +584,12 @@ def main(unused_argv):
         train_model.init(all_length_features[:-1], FLAGS.seed + 1)
       else:
         train_model.init(all_features, FLAGS.seed + 1)
+
+      logging.info(f"Params after restore: {len(train_model.params)}")
+      logging.info("Encoder/decoder keys:")
+      for k in sorted(train_model.params.keys()):
+          if '_construct_encoders_decoders' in k:
+              logging.info(f"  {k}: {list(train_model.params[k].keys())}")
       
       if FLAGS.load_checkpoint_path:
         train_model.restore_model(FLAGS.load_checkpoint_path, only_load_processor=False)
@@ -633,10 +651,12 @@ def main(unused_argv):
       if (sum(val_scores) > best_score) or step == 0:
         best_score = sum(val_scores)
         logging.info('Checkpointing best model, %s', msg)
-        checkpoint_name = "+".join(FLAGS.algorithms)
+        checkpoint_name = f"{run_id}-"
+        checkpoint_name += "+".join(FLAGS.algorithms)
         checkpoint_name += f"-shared={FLAGS.shared_encoders_decoders}"
         checkpoint_name += f"-encdec_rank={FLAGS.encoder_decoder_rank}"
         checkpoint_name += f"-steps={FLAGS.train_steps}"
+        print(f"checkpoint_name: {checkpoint_name}")
         train_model.save_model(f'{checkpoint_name}.pkl')
       else:
         logging.info('Not saving new best model, %s', msg)

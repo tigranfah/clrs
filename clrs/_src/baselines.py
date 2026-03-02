@@ -155,6 +155,7 @@ class BaselineModel(model.Model):
       grad_clip_max_norm: float = 0.0,
       checkpoint_path: str = '/tmp/clrs3',
       freeze_processor: bool = False,
+      freeze_encoders_decoders_base: bool = False,
       dropout_prob: float = 0.0,
       hint_teacher_forcing: float = 0.0,
       hint_repred_mode: str = 'soft',
@@ -162,7 +163,8 @@ class BaselineModel(model.Model):
       nb_msg_passing_steps: int = 1,
       debug: bool = False,
       shared_encoders_decoders: bool = False,
-      encoder_decoder_rank: int = 0
+      encoder_decoder_rank: int = 0,
+      num_lora_slots: int = None,
   ):
     """Constructor for BaselineModel.
 
@@ -223,6 +225,7 @@ class BaselineModel(model.Model):
     self.checkpoint_path = checkpoint_path
     self.name = name
     self._freeze_processor = freeze_processor
+    self._freeze_encoders_decoders_base = freeze_encoders_decoders_base
     if grad_clip_max_norm != 0.0:
       optax_chain = [optax.clip_by_global_norm(grad_clip_max_norm),
                      optax.scale_by_adam(),
@@ -250,14 +253,15 @@ class BaselineModel(model.Model):
 
     self._create_net_fns(hidden_dim, encode_hints, processor_factory, use_lstm,
                          encoder_init, dropout_prob, hint_teacher_forcing,
-                         hint_repred_mode, shared_encoders_decoders, encoder_decoder_rank)
+                         hint_repred_mode, shared_encoders_decoders, encoder_decoder_rank, num_lora_slots)
     self._device_params = None
     self._device_opt_state = None
     self.opt_state_skeleton = None
 
   def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
                       use_lstm, encoder_init, dropout_prob,
-                      hint_teacher_forcing, hint_repred_mode, shared_encoders_decoders, encoder_decoder_rank):
+                      hint_teacher_forcing, hint_repred_mode, shared_encoders_decoders,
+                      encoder_decoder_rank, num_lora_slots):
     def _use_net(*args, **kwargs):
       return nets.Net(self._spec, hidden_dim, encode_hints, self.decode_hints,
                       processor_factory, use_lstm, encoder_init,
@@ -266,7 +270,8 @@ class BaselineModel(model.Model):
                       self.nb_dims, self.nb_msg_passing_steps,
                       self.debug,
                       shared_encoders_decoders=shared_encoders_decoders,
-                      encoder_decoder_rank=encoder_decoder_rank)(*args, **kwargs)
+                      encoder_decoder_rank=encoder_decoder_rank,
+                      num_lora_slots=num_lora_slots)(*args, **kwargs)
 
     self.net_fn = hk.transform(_use_net)
     pmap_args = dict(axis_name='batch', devices=jax.local_devices())
@@ -452,11 +457,21 @@ class BaselineModel(model.Model):
   def _update_params(self, params, grads, opt_state, algorithm_index):
     updates, opt_state = filter_null_grads(
         grads, self.opt, opt_state, self.opt_state_skeleton, algorithm_index)
-    if self._freeze_processor:
-      params_subset = _filter_out_processor(params)
-      updates_subset = _filter_out_processor(updates)
-      assert len(params) > len(params_subset)
-      assert params_subset
+    if self._freeze_processor or self._freeze_encoders_decoders_base:
+      params_subset = params
+      updates_subset = updates
+      if self._freeze_processor:
+        params_subset = _filter_out_processor(params_subset)
+        updates_subset = _filter_out_processor(updates_subset)
+        assert len(params) > len(params_subset)
+        assert params_subset
+      if self._freeze_encoders_decoders_base:
+        params_subset = _filter_out_encoder_decoder_base_weights(params_subset)
+        updates_subset = _filter_out_encoder_decoder_base_weights(updates_subset)
+        n_before = sum(len(v) for v in params.values())
+        n_after = sum(len(v) for v in params_subset.values())
+        assert n_before > n_after, f"Filtering didn't remove any params: {n_before} vs {n_after}"
+        assert params_subset
       new_params = optax.apply_updates(params_subset, updates_subset)
       new_params = hk.data_structures.merge(params, new_params)
     else:
@@ -711,6 +726,14 @@ def _param_in_processor(module_name):
   return processors.PROCESSOR_TAG in module_name
 
 
+def _param_in_encoders_decoders(module_name):
+  return '_construct_encoders_decoders' in module_name
+
+
+def _param_is_base_weight(module_name, param_name):
+  return _param_in_encoders_decoders(module_name) and param_name in ['w', 'b']
+
+
 def _filter_out_processor(params: hk.Params) -> hk.Params:
   return hk.data_structures.filter(
       lambda module_name, n, v: not _param_in_processor(module_name), params)
@@ -719,6 +742,12 @@ def _filter_out_processor(params: hk.Params) -> hk.Params:
 def _filter_in_processor(params: hk.Params) -> hk.Params:
   return hk.data_structures.filter(
       lambda module_name, n, v: _param_in_processor(module_name), params)
+
+
+def _filter_out_encoder_decoder_base_weights(params: hk.Params) -> hk.Params:
+    return hk.data_structures.filter(
+        lambda module_name, param_name, v: not _param_is_base_weight(module_name, param_name), 
+        params)
 
 
 def _is_not_done_broadcast(lengths, i, tensor):
