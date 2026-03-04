@@ -18,3 +18,8 @@ checkpoints/
 # Editors
 .idea
 .vscode
+
+check_spec.py
+debug_checkpoint.py
+matlab.mplstyle
+logs

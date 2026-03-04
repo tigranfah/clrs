@@ -8,15 +8,14 @@ from absl import logging
 import clrs
 import jax
 import numpy as np
+import tensorflow as tf
 
 
 flags.DEFINE_list('algorithms', ['bfs'], 'Which algorithms to evaluate.')
-flags.DEFINE_string('checkpoint_path', None, 
+flags.DEFINE_string('checkpoint_path', 'checkpoints',
                     'Path to pretrained checkpoint dir.')
-flags.mark_flag_as_required('checkpoint_path')
-flags.DEFINE_string('checkpoint_name', None, 
-                    'Name of pretrained checkpoint.')
-flags.mark_flag_as_required('checkpoint_name')
+flags.DEFINE_string('checkpoint_name', None,
+                    'Name of pretrained checkpoint. If not provided, evaluates randomly initialized model.')
 
 flags.DEFINE_list('train_lengths', ['4', '7', '11', '13', '16'],
                   'Training sizes used during training.')
@@ -49,18 +48,7 @@ flags.DEFINE_float('dropout_prob', 0.0, 'Dropout rate to use.')
 
 flags.DEFINE_enum('hint_mode', 'encoded_decoded',
                   ['encoded_decoded', 'decoded_only', 'none'],
-                  'How should hints be used? Note, each mode defines a '
-                  'separate task, with various difficulties. encoded_decoded '
-                  'requires the model to explicitly materialise hint sequences '
-                  'and therefore is hardest, but also most aligned to the '
-                  'underlying algorithmic rule. Hence, encoded_decoded '
-                  'should be treated as the default mode for our benchmark. '
-                  'In decoded_only, hints are only used for defining '
-                  'reconstruction losses. Often, this will perform well, but '
-                  'note that we currently do not make any efforts to '
-                  'counterbalance the various hint losses. Hence, for certain '
-                  'tasks, the best performance will now be achievable with no '
-                  'hint usage at all (none).')
+                  'How should hints be used?')
 flags.DEFINE_enum('encoder_init', 'xavier_on_scalars',
                   ['default', 'xavier_on_scalars'],
                   'Initialiser to use for the encoders.')
@@ -69,6 +57,8 @@ flags.DEFINE_boolean('shared_encoders_decoders', False,
                      'Whether to use a shared set of encoders and decoders for all algorithms')
 flags.DEFINE_integer('encoder_decoder_rank', 0,
                      'If shared encoders and decoders are used what rank matrix to use for specific algorithm specialization')
+flags.DEFINE_integer('num_lora_slots', 7,
+                     'Total number of task slots in LoRA adapters')
 
 flags.DEFINE_boolean('random_pos', True,
                      'Randomize the pos input common to all algos.')
@@ -104,7 +94,7 @@ PRED_AS_INPUT_ALGOS = [
 
 def unpack(v):
   try:
-    return v.item()  # DeviceArray  # pytype: disable=attribute-error
+    return v.item()
   except (AttributeError, ValueError):
     return v
 
@@ -114,43 +104,35 @@ def _iterate_sampler(sampler, batch_size):
     yield sampler.next(batch_size)
 
 
+def _maybe_download_dataset(dataset_path, download=True):
+  """Download CLRS30 dataset if needed."""
+  dataset_folder = os.path.join(dataset_path, clrs.get_clrs_folder())
+  if not download and os.path.isdir(dataset_folder):
+    logging.info('Dataset found at %s. Skipping download.', dataset_folder)
+    return dataset_folder
+  logging.info('Dataset not found in %s. Downloading...', dataset_folder)
+
+  import requests
+  import shutil
+  clrs_url = clrs.get_dataset_gcp_url()
+  request = requests.get(clrs_url, allow_redirects=True)
+  clrs_file = os.path.join(dataset_path, os.path.basename(clrs_url))
+  os.makedirs(dataset_folder, exist_ok=True)
+  open(clrs_file, 'wb').write(request.content)
+  shutil.unpack_archive(clrs_file, extract_dir=dataset_folder)
+  os.remove(clrs_file)
+  return dataset_folder
+
+
 def _concat(dps, axis):
   return jax.tree_util.tree_map(lambda *x: np.concatenate(x, axis), *dps)
 
 
-def make_sampler(length: int,
-                 rng: Any,
-                 algorithm: str,
-                 split: str,
-                 batch_size: int,
-                 multiplier: int,
-                 randomize_pos: bool,
-                 enforce_pred_as_input: bool,
-                 enforce_permutations: bool,
-                 sampler_kwargs: Dict[str, Any]):
-  """Create a sampler with given options.
-
-  Args:
-    length: Size of samples (i.e., number of nodes in the graph).
-      A length of -1 will mean that the benchmark
-      dataset (for the given split) is used. Positive sizes will instantiate
-      samplers of the corresponding size.
-    rng: Numpy random state.
-    algorithm: The name of the algorithm to sample from.
-    split: 'train', 'val' or 'test'.
-    batch_size: Samples per batch.
-    multiplier: Integer multiplier for the number of samples in the dataset,
-      only used for positive sizes. Negative multiplier means infinite samples.
-    randomize_pos: Whether to randomize the pos input.
-    enforce_pred_as_input: Whether to convert fixed pred_h hints to inputs.
-    enforce_permutations: Whether to enforce permutation pointers.
-    sampler_kwargs: Extra args passed to the sampler.
-  Returns:
-    A sampler (iterator), the number of samples in the iterator (negative
-    if infinite samples), and the spec.
-  """
-  if length < 0:  # load from file
-    dataset_folder = os.path.join(FLAGS.dataset_path, clrs.get_clrs_folder())
+def make_sampler(length, rng, algorithm, split, batch_size, multiplier,
+                 randomize_pos, enforce_pred_as_input, enforce_permutations,
+                 sampler_kwargs):
+  if length < 0:
+    dataset_folder = _maybe_download_dataset(FLAGS.dataset_path)
     sampler, num_samples, spec = clrs.create_dataset(folder=dataset_folder,
                                                      algorithm=algorithm,
                                                      batch_size=batch_size,
@@ -164,7 +146,7 @@ def make_sampler(length: int,
         num_samples=num_samples,
         length=length,
         **sampler_kwargs,
-        )
+    )
     sampler = _iterate_sampler(sampler, batch_size)
 
   if randomize_pos:
@@ -176,7 +158,6 @@ def make_sampler(length: int,
 
 
 def make_multi_sampler(sizes, rng, **kwargs):
-  """Create a sampler with cycling sample sizes."""
   ss = []
   tot_samples = 0
   for length in sizes:
@@ -192,7 +173,6 @@ def make_multi_sampler(sizes, rng, **kwargs):
 
 
 def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras):
-  """Collect batches of output and hint preds and evaluate them."""
   processed_samples = 0
   preds = []
   outputs = []
@@ -212,8 +192,7 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras):
   return {k: unpack(v) for k, v in out.items()}
 
 
-def create_samplers(rng, train_lengths: List[int], algorithms: List[str]):
-  
+def create_samplers(rng, train_lengths, algorithms):
   val_samplers = []
   val_sample_counts = []
   test_samplers = []
@@ -223,52 +202,53 @@ def create_samplers(rng, train_lengths: List[int], algorithms: List[str]):
   for algorithm in algorithms:
     current_train_lengths = train_lengths
 
-    if algorithm in ['naive_string_matcher', 'kmp_matcher']:
-      max_length = max(current_train_lengths)
-      if max_length > 0:  # if < 0, we are using the benchmark data
-        max_length = (max_length * 5) // 4
-      current_train_lengths = [max_length]
+    with tf.device('/cpu:0'):
+      if algorithm in ['naive_string_matcher', 'kmp_matcher']:
+        max_length = max(current_train_lengths)
+        if max_length > 0:
+          max_length = (max_length * 5) // 4
+        current_train_lengths = [max_length]
 
-    logging.info('Creating samplers for algo %s', algorithm)
+      logging.info('Creating samplers for algo %s', algorithm)
 
-    p = tuple([0.1 + 0.1 * i for i in range(9)])
-    if p and algorithm in ['articulation_points', 'bridges',
-                           'mst_kruskal', 'bipartite_matching']:
-      # Choose a lower connection probability for the above algorithms,
-      # otherwise trajectories are very long
-      p = tuple(np.array(p) / 2)
-    length_needle = FLAGS.length_needle
-    sampler_kwargs = dict(p=p, length_needle=length_needle)
-    if length_needle == 0:
-      sampler_kwargs.pop('length_needle')
+      p = tuple([0.1 + 0.1 * i for i in range(9)])
+      if p and algorithm in ['articulation_points', 'bridges',
+                             'mst_kruskal', 'bipartite_matching']:
+        p = tuple(np.array(p) / 2)
+      length_needle = FLAGS.length_needle
+      sampler_kwargs = dict(p=p, length_needle=length_needle)
+      if length_needle == 0:
+        sampler_kwargs.pop('length_needle')
 
-    common_sampler_args = dict(
-        algorithm=algorithm,
-        rng=rng,
-        enforce_pred_as_input=FLAGS.enforce_pred_as_input,
-        enforce_permutations=FLAGS.enforce_permutations,
-        )
+      common_sampler_args = dict(
+          algorithm=algorithm,
+          rng=rng,
+          enforce_pred_as_input=FLAGS.enforce_pred_as_input,
+          enforce_permutations=FLAGS.enforce_permutations,
+      )
 
-    mult = clrs.CLRS_30_ALGS_SETTINGS[algorithm]['num_samples_multiplier']
-    val_args = dict(
-        sizes=[np.amax(current_train_lengths)],
-        split='val',
-        batch_size=FLAGS.batch_size,
-        multiplier=2 * mult,
-        randomize_pos=FLAGS.random_pos,
-        sampler_kwargs=sampler_kwargs,
-        **common_sampler_args,
-    )
-    val_sampler, val_samples, _ = make_multi_sampler(**val_args)
+      mult = clrs.CLRS_30_ALGS_SETTINGS[algorithm]['num_samples_multiplier']
+      val_args = dict(
+          sizes=[np.amax(current_train_lengths)],
+          split='val',
+          batch_size=FLAGS.batch_size,
+          multiplier=2 * mult,
+          randomize_pos=FLAGS.random_pos,
+          sampler_kwargs=sampler_kwargs,
+          **common_sampler_args,
+      )
+      val_sampler, val_samples, _ = make_multi_sampler(**val_args)
 
-    test_args = dict(sizes=[-1],
-                     split='test',
-                     batch_size=FLAGS.batch_size,
-                     multiplier=2 * mult,
-                     randomize_pos=False,
-                     sampler_kwargs={},
-                     **common_sampler_args)
-    test_sampler, test_samples, spec = make_multi_sampler(**test_args)
+      test_args = dict(
+          sizes=[-1],
+          split='test',
+          batch_size=FLAGS.batch_size,
+          multiplier=2 * mult,
+          randomize_pos=False,
+          sampler_kwargs={},
+          **common_sampler_args,
+      )
+      test_sampler, test_samples, spec = make_multi_sampler(**test_args)
 
     spec_list.append(spec)
     val_samplers.append(val_sampler)
@@ -333,8 +313,9 @@ def main(unused_argv):
       hint_repred_mode='soft',
       nb_msg_passing_steps=FLAGS.nb_msg_passing_steps,
       shared_encoders_decoders=FLAGS.shared_encoders_decoders,
-      encoder_decoder_rank=FLAGS.encoder_decoder_rank
-      )
+      encoder_decoder_rank=FLAGS.encoder_decoder_rank,
+      num_lora_slots=FLAGS.num_lora_slots,
+  )
 
   eval_model = clrs.models.BaselineModel(
       spec=spec_list,
@@ -342,10 +323,16 @@ def main(unused_argv):
       **model_params
   )
 
+  # Init with val sampler features
   all_features = [next(t).features for t in val_samplers]
   eval_model.init(all_features, FLAGS.seed + 1)
 
-  eval_model.restore_model(FLAGS.checkpoint_name, only_load_processor=False)
+  # Load checkpoint if provided, otherwise evaluate random init
+  if FLAGS.checkpoint_name:
+    logging.info('Loading checkpoint: %s', FLAGS.checkpoint_name)
+    eval_model.restore_model(FLAGS.checkpoint_name, only_load_processor=False)
+  else:
+    logging.info('No checkpoint provided, evaluating randomly initialized model.')
 
   for algo_idx in range(len(FLAGS.algorithms)):
     common_extras = {'algorithm': FLAGS.algorithms[algo_idx]}

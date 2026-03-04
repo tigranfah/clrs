@@ -25,13 +25,11 @@ flags.mark_flag_as_required('algorithm')
 
 
 def main(argv):
-    print(f'Loading checkpoint: {FLAGS.input_checkpoint}')
     with open(FLAGS.input_checkpoint, 'rb') as f:
         checkpoint = pickle.load(f)
     
     old_params = checkpoint['params']
     
-    print(f'Building model for {FLAGS.algorithm}')
     sampler, spec = clrs.build_sampler(
         FLAGS.algorithm,
         seed=42,
@@ -68,17 +66,10 @@ def main(argv):
         encoder_decoder_rank=FLAGS.lora_rank,
         num_lora_slots=FLAGS.num_lora_slots,
     )
-    
-    print('Initializing model for target algorithm')
     model.init([feedback.features], 42)
     
     new_params = model.params
 
-    print(f'\nAll param keys BEFORE copying ({len(new_params)} total):')
-    for k in sorted(new_params.keys()):
-        print(f'  {k}')
-    
-    print('Copying weights from checkpoint where available')
     copied = []
     initialized = []
     
@@ -90,23 +81,16 @@ def main(argv):
             initialized.append(module_name)
     
     new_checkpoint = {'params': new_params}
-    
-    print(f'\nCopied {len(copied)} modules from checkpoint')
-    print(f'Randomly initialized {len(initialized)} missing modules:')
-    for m in initialized:
-        print(f'  {m}')
-    
-    print(f'\nFinal checkpoint keys ({len(new_params)} total):')
+        
+    print(f'Model weight names ({len(new_params)}):')
     for k in sorted(new_params.keys()):
         if '_construct_encoders_decoders' in k:
             print(f'  {k}: {list(new_params[k].keys())}')
     
-    print(f'\nSaving to {FLAGS.output_checkpoint}')
+    print(f'Saving to {FLAGS.output_checkpoint}')
     os.makedirs(os.path.dirname(FLAGS.output_checkpoint) or '.', exist_ok=True)
     with open(FLAGS.output_checkpoint, 'wb') as f:
         pickle.dump(new_checkpoint, f)
-    
-    print('Done')
 
 
 if __name__ == '__main__':

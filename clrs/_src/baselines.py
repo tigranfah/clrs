@@ -470,7 +470,7 @@ class BaselineModel(model.Model):
         updates_subset = _filter_out_encoder_decoder_base_weights(updates_subset)
         n_before = sum(len(v) for v in params.values())
         n_after = sum(len(v) for v in params_subset.values())
-        assert n_before > n_after, f"Filtering didn't remove any params: {n_before} vs {n_after}"
+        assert n_before > n_after
         assert params_subset
       new_params = optax.apply_updates(params_subset, updates_subset)
       new_params = hk.data_structures.merge(params, new_params)
